@@ -207,6 +207,7 @@ def room_sensor_special(client, value: float):
         publish(client, {"local_temperature_calibration": round(corrected, 1)})
         log(f"🛠 Room sensor calibration applied: {round(corrected,1)}")
     radiator_valve_state["room_sensor_temp"] = value
+    client.publish(f"{ROOM_TOPIC}/pv", json.dumps(value), qos=0)
     update_cfh(client)
     if _last_temp != value:
         _last_temp = value
