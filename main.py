@@ -169,6 +169,7 @@ def fetch_room_config(room_name: str):
         broadcast_sse()
     except Exception as e:
         log("❌ Failed to fetch room config:", e)
+        exit(1)
 
 def periodic_room_config_fetch():
     while True:
