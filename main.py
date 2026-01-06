@@ -6,6 +6,8 @@ import json
 import threading
 import queue
 import requests
+import atexit
+import signal
 import paho.mqtt.client as mqtt
 from typing import Any, Dict, Callable
 from flask import Flask, Response, render_template_string
@@ -35,6 +37,8 @@ ALERT_NO_CHANGE_SECONDS = int(os.getenv("ALERT_NO_CHANGE_SECONDS", 600))
 GLOBAL_SLEEP_TOPIC = os.getenv("GLOBAL_SLEEP_TOPIC", "heating/sleep")
 ROOM_CONFIG_REFRESH_INTERVAL = int(os.getenv("ROOM_CONFIG_REFRESH_INTERVAL", 300))  # default 300s
 
+ROOM_NAME_SMOOTH = ROOM_NAME.replace(" ", "")
+LWT_TOPIC = f"units/{ROOM_NAME_SMOOTH}-radiator-control".lower()
 
 # =======================
 # STATE
@@ -58,10 +62,7 @@ MQTT_TOPIC_CORRECTION: str = None
 
 mqtt_client_ref: mqtt.Client = None
 
-# Next fetch time
 _next_room_config_fetch: float = None
-
-# SSE queue
 sse_queue = queue.Queue(maxsize=10)
 
 # =======================
@@ -83,7 +84,6 @@ def merge_and_diff(update: dict) -> dict:
         return changes
     for key, new_value in update.items():
         old_value = radiator_valve_state.get(key)
-        # Skip overwriting eco/comfort/SP if we are in startup-ignore mode
         if _ignore_initial_valve_updates and key in ["eco_temperature", "comfort_temperature", "current_heating_setpoint"]:
             continue
         if old_value != new_value and last_published.get(key) != new_value:
@@ -114,7 +114,7 @@ def publish(client: mqtt.Client, payload: dict, topic: str = None):
 def periodic_cfh_loop():
     global mqtt_client_ref
     while True:
-        time.sleep(20)  # every 20 seconds
+        time.sleep(20)
         if mqtt_client_ref:
             update_cfh(mqtt_client_ref)
 
@@ -153,12 +153,9 @@ def fetch_room_config(room_name: str):
             return
         room = data[0]
         ROOM_TOPIC = room.get("rootTopic")
-        room_name_smol = room_name.replace(" ", "")
         log(f"Room Topic: {ROOM_TOPIC}")
-        log(f"Room Name: {room_name_smol}")
-        MQTT_TOPIC_THERMOSTAT = f"zigbee2mqtt/{room_name_smol}RV"
-        MQTT_TOPIC_CORRECTION = f"zigbee2mqtt/{room_name_smol}TH"
-        log("")
+        MQTT_TOPIC_THERMOSTAT = f"zigbee2mqtt/{ROOM_NAME_SMOOTH}RV"
+        MQTT_TOPIC_CORRECTION = f"zigbee2mqtt/{ROOM_NAME_SMOOTH}TH"
         radiator_valve_state.update({
             "eco_temperature": room.get("sleepTemperature"),
             "comfort_temperature": room.get("standbyTemperature"),
@@ -173,7 +170,7 @@ def fetch_room_config(room_name: str):
 
 def periodic_room_config_fetch():
     while True:
-        time.sleep(5)  # check frequently, sleep short
+        time.sleep(5)
         if _next_room_config_fetch is None or time.time() >= _next_room_config_fetch:
             fetch_room_config(ROOM_NAME)
 
@@ -213,7 +210,6 @@ def room_sensor_special(client, value: float):
         _last_temp = value
         _last_temp_time = time.time()
         log(f"🌡 Room temp updated: {value}")
-    # Stop ignoring initial valve updates after first real temperature reading
     if _ignore_initial_valve_updates:
         _ignore_initial_valve_updates = False
 
@@ -249,16 +245,17 @@ def on_connect(client, userdata, flags, rc):
         log("❌ MQTT connection failed with code", rc)
         sys.exit(1)
     log("✅ Connected to MQTT:", rc)
+    client.publish(LWT_TOPIC, "Online", qos=0, retain=True)
 
     client.subscribe(MQTT_TOPIC_THERMOSTAT, qos=0)
     for key in ["eco_temperature", "comfort_temperature", "current_heating_setpoint"]:
         value = radiator_valve_state.get(key)
         if value is not None:
-            last_published[key] = None  # force publish
+            last_published[key] = None
             publish(client, {key: value})
     client.subscribe(MQTT_TOPIC_CORRECTION, qos=0)
     client.subscribe(f"{ROOM_TOPIC}/#", qos=0)
-    client.subscribe(GLOBAL_SLEEP_TOPIC, qos=0)  # ✅ subscribe to global sleep
+    client.subscribe(GLOBAL_SLEEP_TOPIC, qos=0)
 
 def on_disconnect(client, userdata, rc):
     log("🔌 Disconnected:", rc)
@@ -267,12 +264,11 @@ def on_message(client, userdata, msg):
     payload = decode_payload(msg.payload)
     if payload is None:
         return
-    # Handle global sleep republish
     if msg.topic == GLOBAL_SLEEP_TOPIC:
         log(f"🌐 Global sleep message received: {payload} → republishing to room")
         try:
             val = bool(payload)
-            client.publish(f"{ROOM_TOPIC}/sleep", json.dumps(val), qos=0)
+            client.publish(f"{ROOM_TOPIC}/sleep", val, qos=0)
         except Exception as e:
             log("⚠️ Failed to republish global sleep:", e)
         return
@@ -292,10 +288,10 @@ def on_message(client, userdata, msg):
         for key, (_, new) in changes.items():
             radiator_valve_state[key] = new
             if key in ["eco_temperature", "comfort_temperature"]:
-                client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", json.dumps(new), qos=0)
+                client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", new, qos=0)
             if key == "current_heating_setpoint":
                 if time.time() >= _ignore_sp_until:
-                    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(new), qos=0)
+                    client.publish(f"{ROOM_TOPIC}/sp", new, qos=0)
         update_cfh(client)
         broadcast_sse()
     elif msg.topic in topic_map:
@@ -398,15 +394,7 @@ function render(data){
 const evt=new EventSource("/events");
 evt.onmessage=e=>{ render(JSON.parse(e.data)); };
 
-setInterval(()=>{
-  if(nextFetchTime){
-    let now=Math.floor(Date.now()/1000);
-    let diff=nextFetchTime-now;
-    let target=new Date(nextFetchTime*1000);
-    if(diff<0) diff=0;
-    nextFetch.innerText=`Next fetch in ${diff.toFixed(0)}s at ${target.toLocaleTimeString()}`;
-  }
-},1000);
+setInterval(()=>{ if(nextFetchTime){ let now=Math.floor(Date.now()/1000); let diff=nextFetchTime-now; let target=new Date(nextFetchTime*1000); if(diff<0) diff=0; nextFetch.innerText=`Next fetch in ${diff.toFixed(0)}s at ${target.toLocaleTimeString()}`; } },1000);
 </script>
 </body>
 </html>
@@ -414,31 +402,40 @@ setInterval(()=>{
     return render_template_string(html, room_name=ROOM_NAME)
 
 # =======================
+# CLEANUP
+# =======================
+def clean_exit(*args):
+    log("⚠️ Shutting down, publishing disconnecting...")
+    if mqtt_client_ref:
+        mqtt_client_ref.publish(LWT_TOPIC, "Disconnecting", qos=0, retain=True)
+        mqtt_client_ref.disconnect()
+    sys.exit(0)
+
+atexit.register(clean_exit)
+signal.signal(signal.SIGINT, clean_exit)
+signal.signal(signal.SIGTERM, clean_exit)
+
+# =======================
 # MAIN
 # =======================
 def main():
-    global mqtt_client_ref, _last_temp_time, radiator_valve_state
+    global mqtt_client_ref
     fetch_room_config(ROOM_NAME)
 
-    client = mqtt.Client()
-    mqtt_client_ref = client
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.on_disconnect = on_disconnect
-    try:
-        client.connect(MQTT_HOST, MQTT_PORT, KEEPALIVE)
-    except Exception as e:
-        log("❌ MQTT connection failed:", e)
-        sys.exit(1)
-    client.loop_start()
-    _last_temp_time = time.time()
-    threading.Thread(target=heat_alert_loop, daemon=True).start()
+    mqtt_client_ref = mqtt.Client()
+    mqtt_client_ref.will_set(LWT_TOPIC, "Dying", qos=0, retain=True)
+    mqtt_client_ref.on_connect = on_connect
+    mqtt_client_ref.on_disconnect = on_disconnect
+    mqtt_client_ref.on_message = on_message
+
+    mqtt_client_ref.connect(MQTT_HOST, MQTT_PORT, KEEPALIVE)
+
     threading.Thread(target=periodic_cfh_loop, daemon=True).start()
+    threading.Thread(target=heat_alert_loop, daemon=True).start()
     threading.Thread(target=periodic_room_config_fetch, daemon=True).start()
-    # expose next fetch in SSE
-    radiator_valve_state["_next_room_config_fetch"] = time.time() + ROOM_CONFIG_REFRESH_INTERVAL
-    broadcast_sse()
-    app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
+
+    mqtt_client_ref.loop_start()
+    app.run(host="0.0.0.0", port=WEB_PORT, debug=False)
 
 if __name__ == "__main__":
     main()
