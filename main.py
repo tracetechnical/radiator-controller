@@ -147,10 +147,12 @@ def fetch_room_config(room_name: str):
         room = data[0]
         ROOM_TOPIC = room.get("rootTopic")
         room_name_smol = room_name.replace(" ", "")
-        log(f"Room Topic: {ROOM_TOPIC}")
+        log(f"🔔 Room Topic: {ROOM_TOPIC}")
         log(f"Room Name: {room_name_smol}")
         MQTT_TOPIC_THERMOSTAT = f"zigbee2mqtt/{room_name_smol}RV"
         MQTT_TOPIC_CORRECTION = f"zigbee2mqtt/{room_name_smol}TH"
+        log(f"🔔 Rad Valve: {MQTT_TOPIC_THERMOSTAT}")
+        log(f"🔔 Room Sensor: {MQTT_TOPIC_CORRECTION}")
         radiator_valve_state.update({
             "eco_temperature": room.get("sleepTemperature"),
             "comfort_temperature": room.get("standbyTemperature"),
