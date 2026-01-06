@@ -27,7 +27,7 @@ if not HEAT_ALERT_TOPIC:
     print("❌ HEAT_ALERT_TOPIC environment variable is required")
     sys.exit(1)
 
-# Global sleep topic (default heating/sleep)
+# Global sleep topic
 HEATING_SLEEP_GLOBAL_TOPIC = os.getenv(
     "HEATING_SLEEP_GLOBAL_TOPIC", "heating/sleep"
 )
@@ -42,8 +42,6 @@ ROOM_CONFIG_REFRESH_SECONDS = 300  # 5 minutes
 # =======================
 # STATE
 # =======================
-_ignore_initial_valve_updates = True
-
 radiator_valve_state: Dict[str, Any] = {
     "cfh": None
 }
@@ -52,13 +50,11 @@ sleep_mode: Optional[bool] = None
 last_published: Dict[str, Any] = {}
 last_cfh = None
 
-_ignore_sensor_until = 0.0
-_ignore_sp_until = 0.0
-
 _last_temp = None
 _last_temp_time = None
 
 ROOM_TOPIC = None
+ROOM_SLEEP_TOPIC = None
 MQTT_TOPIC_THERMOSTAT = None
 MQTT_TOPIC_CORRECTION = None
 
@@ -129,7 +125,7 @@ def periodic_cfh_loop():
 # ROOM CONFIG
 # =======================
 def fetch_room_config(room_name: str):
-    global ROOM_TOPIC, MQTT_TOPIC_THERMOSTAT, MQTT_TOPIC_CORRECTION
+    global ROOM_TOPIC, ROOM_SLEEP_TOPIC, MQTT_TOPIC_THERMOSTAT, MQTT_TOPIC_CORRECTION
     url = f"http://json.io.home/heating?name={room_name.replace(' ', '%20')}"
     try:
         resp = requests.get(url, timeout=5)
@@ -140,6 +136,8 @@ def fetch_room_config(room_name: str):
         room = data[0]
 
         ROOM_TOPIC = room["rootTopic"]
+        ROOM_SLEEP_TOPIC = f"{ROOM_TOPIC}/sleep"
+
         room_short = room_name.replace(" ", "")
         MQTT_TOPIC_THERMOSTAT = f"zigbee2mqtt/{room_short}RV"
         MQTT_TOPIC_CORRECTION = f"zigbee2mqtt/{room_short}TH"
@@ -169,29 +167,6 @@ def room_config_loop():
 # =======================
 # SLEEP HANDLING
 # =======================
-def apply_sleep_mode(client: mqtt.Client, new_sleep: bool):
-    global sleep_mode
-
-    if sleep_mode == new_sleep:
-        return
-
-    sleep_mode = new_sleep
-    radiator_valve_state["sleep"] = sleep_mode
-
-    if sleep_mode:
-        sp = radiator_valve_state.get("eco_temperature")
-        log("🌙 Global sleep ON")
-    else:
-        sp = radiator_valve_state.get("comfort_temperature")
-        log("☀️ Global sleep OFF")
-
-    if sp is not None:
-        radiator_valve_state["current_heating_setpoint"] = sp
-        publish(client, {"current_heating_setpoint": sp})
-
-    update_cfh(client)
-    broadcast_sse()
-
 def parse_sleep_payload(payload: Any) -> Optional[bool]:
     if isinstance(payload, bool):
         return payload
@@ -204,6 +179,29 @@ def parse_sleep_payload(payload: Any) -> Optional[bool]:
         if p in ("0", "false", "off", "no"):
             return False
     return None
+
+def apply_sleep_mode(client: mqtt.Client, new_sleep: bool):
+    global sleep_mode
+
+    if sleep_mode == new_sleep:
+        return
+
+    sleep_mode = new_sleep
+    radiator_valve_state["sleep"] = sleep_mode
+
+    if sleep_mode:
+        sp = radiator_valve_state.get("eco_temperature")
+        log("🌙 Sleep ON")
+    else:
+        sp = radiator_valve_state.get("comfort_temperature")
+        log("☀️ Sleep OFF")
+
+    if sp is not None:
+        radiator_valve_state["current_heating_setpoint"] = sp
+        publish(client, {"current_heating_setpoint": sp})
+
+    update_cfh(client)
+    broadcast_sse()
 
 # =======================
 # MQTT CALLBACKS
@@ -220,8 +218,16 @@ def on_message(client, userdata, msg):
 
     payload = decode_payload(msg.payload)
 
-    # Global sleep
+    # Global sleep → write to room sleep topic
     if msg.topic == HEATING_SLEEP_GLOBAL_TOPIC:
+        sleep_val = parse_sleep_payload(payload)
+        if sleep_val is not None:
+            client.publish(ROOM_SLEEP_TOPIC, json.dumps(sleep_val), qos=0)
+            log(f"🛏️ Global sleep → {ROOM_SLEEP_TOPIC}: {sleep_val}")
+        return
+
+    # Room sleep (authoritative)
+    if msg.topic == ROOM_SLEEP_TOPIC:
         sleep_val = parse_sleep_payload(payload)
         if sleep_val is not None:
             apply_sleep_mode(client, sleep_val)
