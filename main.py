@@ -6,8 +6,6 @@ import json
 import threading
 import queue
 import requests
-import atexit
-import signal
 import paho.mqtt.client as mqtt
 from typing import Any, Dict, Callable
 from flask import Flask, Response, render_template_string
@@ -35,10 +33,9 @@ WEB_PORT = int(os.getenv("WEB_PORT", 8000))
 ALERT_CHECK_INTERVAL = int(os.getenv("ALERT_CHECK_INTERVAL", 60))
 ALERT_NO_CHANGE_SECONDS = int(os.getenv("ALERT_NO_CHANGE_SECONDS", 600))
 GLOBAL_SLEEP_TOPIC = os.getenv("GLOBAL_SLEEP_TOPIC", "heating/sleep")
-ROOM_CONFIG_REFRESH_INTERVAL = int(os.getenv("ROOM_CONFIG_REFRESH_INTERVAL", 300))  # default 300s
+ROOM_CONFIG_REFRESH_INTERVAL = int(os.getenv("ROOM_CONFIG_REFRESH_INTERVAL", 300))
 
-ROOM_NAME_SMOOTH = ROOM_NAME.replace(" ", "")
-LWT_TOPIC = f"units/{ROOM_NAME_SMOOTH}-radiator-control".lower()
+LWT_TOPIC = f"units/{ROOM_NAME.replace(' ', '').lower()}-radiator-control"
 
 # =======================
 # STATE
@@ -46,9 +43,9 @@ LWT_TOPIC = f"units/{ROOM_NAME_SMOOTH}-radiator-control".lower()
 _ignore_initial_valve_updates: bool = True
 
 radiator_valve_state: Dict[str, Any] = {}
-sleep_mode: bool = None
+sleep_mode: Any = None
 last_published: Dict[str, Any] = {}
-last_cfh: bool = None
+last_cfh: Any = None
 
 _ignore_sensor_until: float = 0.0
 _ignore_sp_until: float = 0.0
@@ -63,6 +60,7 @@ MQTT_TOPIC_CORRECTION: str = None
 mqtt_client_ref: mqtt.Client = None
 
 _next_room_config_fetch: float = None
+
 sse_queue = queue.Queue(maxsize=10)
 
 # =======================
@@ -100,6 +98,9 @@ def publish(client: mqtt.Client, payload: dict, topic: str = None):
         topic = f"{MQTT_TOPIC_THERMOSTAT}/set"
     to_publish = {}
     for key, value in payload.items():
+        # Convert Python bools to lowercase strings before sending
+        if isinstance(value, bool):
+            value = "true" if value else "false"
         if last_published.get(key) != value:
             to_publish[key] = value
             last_published[key] = value
@@ -153,9 +154,9 @@ def fetch_room_config(room_name: str):
             return
         room = data[0]
         ROOM_TOPIC = room.get("rootTopic")
-        log(f"Room Topic: {ROOM_TOPIC}")
-        MQTT_TOPIC_THERMOSTAT = f"zigbee2mqtt/{ROOM_NAME_SMOOTH}RV"
-        MQTT_TOPIC_CORRECTION = f"zigbee2mqtt/{ROOM_NAME_SMOOTH}TH"
+        room_name_smol = room_name.replace(" ", "")
+        MQTT_TOPIC_THERMOSTAT = f"zigbee2mqtt/{room_name_smol}RV"
+        MQTT_TOPIC_CORRECTION = f"zigbee2mqtt/{room_name_smol}TH"
         radiator_valve_state.update({
             "eco_temperature": room.get("sleepTemperature"),
             "comfort_temperature": room.get("standbyTemperature"),
@@ -164,6 +165,7 @@ def fetch_room_config(room_name: str):
         log(f"✅ Loaded room config: ROOM_TOPIC={ROOM_TOPIC}, ECO={radiator_valve_state['eco_temperature']}, "
             f"COMFORT={radiator_valve_state['comfort_temperature']}, SP={radiator_valve_state['current_heating_setpoint']}")
         _next_room_config_fetch = time.time() + ROOM_CONFIG_REFRESH_INTERVAL
+        radiator_valve_state["_next_room_config_fetch"] = _next_room_config_fetch
         broadcast_sse()
     except Exception as e:
         log("❌ Failed to fetch room config:", e)
@@ -177,13 +179,13 @@ def periodic_room_config_fetch():
 # =======================
 # SPECIAL HANDLERS
 # =======================
-def sleep_special(client, value: bool):
+def sleep_special(client, value):
     global _ignore_sp_until
     sp = radiator_valve_state["eco_temperature"] if value else radiator_valve_state["comfort_temperature"]
     radiator_valve_state["current_heating_setpoint"] = sp
     publish(client, {"current_heating_setpoint": sp})
     _ignore_sp_until = time.time() + SP_DEBOUNCE_SECONDS
-    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(sp), qos=0)
+    client.publish(f"{ROOM_TOPIC}/sleep", "true" if value else "false", qos=0)
     log(f"{'🌙 Sleep ON' if value else '☀️ Sleep OFF'} → SP: {sp}")
     update_cfh(client)
 
@@ -245,7 +247,6 @@ def on_connect(client, userdata, flags, rc):
         log("❌ MQTT connection failed with code", rc)
         sys.exit(1)
     log("✅ Connected to MQTT:", rc)
-    client.publish(LWT_TOPIC, "Online", qos=0, retain=True)
 
     client.subscribe(MQTT_TOPIC_THERMOSTAT, qos=0)
     for key in ["eco_temperature", "comfort_temperature", "current_heating_setpoint"]:
@@ -257,17 +258,23 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(f"{ROOM_TOPIC}/#", qos=0)
     client.subscribe(GLOBAL_SLEEP_TOPIC, qos=0)
 
+    # LWT setup
+    client.will_set(LWT_TOPIC.lower(), "Dying connection", qos=0, retain=True)
+    client.publish(LWT_TOPIC.lower(), "Online", qos=0, retain=True)
+
 def on_disconnect(client, userdata, rc):
     log("🔌 Disconnected:", rc)
+    client.publish(LWT_TOPIC.lower(), "Disconnecting", qos=0, retain=True)
 
 def on_message(client, userdata, msg):
     payload = decode_payload(msg.payload)
     if payload is None:
         return
+
     if msg.topic == GLOBAL_SLEEP_TOPIC:
         log(f"🌐 Global sleep message received: {payload} → republishing to room")
         try:
-            val = bool(payload)
+            val = "true" if bool(payload) else "false"
             client.publish(f"{ROOM_TOPIC}/sleep", val, qos=0)
         except Exception as e:
             log("⚠️ Failed to republish global sleep:", e)
@@ -283,15 +290,16 @@ def on_message(client, userdata, msg):
         f"{ROOM_TOPIC}/eco": lambda p: handle_update(client, p, "eco_temperature"),
         f"{ROOM_TOPIC}/comfort": lambda p: handle_update(client, p, "comfort_temperature"),
     }
+
     if msg.topic == MQTT_TOPIC_THERMOSTAT:
         changes = merge_and_diff(payload)
         for key, (_, new) in changes.items():
             radiator_valve_state[key] = new
             if key in ["eco_temperature", "comfort_temperature"]:
-                client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", new, qos=0)
+                client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", json.dumps(new), qos=0)
             if key == "current_heating_setpoint":
                 if time.time() >= _ignore_sp_until:
-                    client.publish(f"{ROOM_TOPIC}/sp", new, qos=0)
+                    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(new), qos=0)
         update_cfh(client)
         broadcast_sse()
     elif msg.topic in topic_map:
@@ -394,26 +402,20 @@ function render(data){
 const evt=new EventSource("/events");
 evt.onmessage=e=>{ render(JSON.parse(e.data)); };
 
-setInterval(()=>{ if(nextFetchTime){ let now=Math.floor(Date.now()/1000); let diff=nextFetchTime-now; let target=new Date(nextFetchTime*1000); if(diff<0) diff=0; nextFetch.innerText=`Next fetch in ${diff.toFixed(0)}s at ${target.toLocaleTimeString()}`; } },1000);
+setInterval(()=>{
+  if(nextFetchTime){
+    let now=Math.floor(Date.now()/1000);
+    let diff=Math.floor(nextFetchTime - now);
+    let target=new Date(nextFetchTime*1000);
+    if(diff<0) diff=0;
+    nextFetch.innerText=`Next fetch in ${diff}s (${target.toLocaleTimeString()})`;
+  }
+},1000);
 </script>
 </body>
 </html>
 """
     return render_template_string(html, room_name=ROOM_NAME)
-
-# =======================
-# CLEANUP
-# =======================
-def clean_exit(*args):
-    log("⚠️ Shutting down, publishing disconnecting...")
-    if mqtt_client_ref:
-        mqtt_client_ref.publish(LWT_TOPIC, "Disconnecting", qos=0, retain=True)
-        mqtt_client_ref.disconnect()
-    sys.exit(0)
-
-atexit.register(clean_exit)
-signal.signal(signal.SIGINT, clean_exit)
-signal.signal(signal.SIGTERM, clean_exit)
 
 # =======================
 # MAIN
@@ -422,20 +424,19 @@ def main():
     global mqtt_client_ref
     fetch_room_config(ROOM_NAME)
 
-    mqtt_client_ref = mqtt.Client()
-    mqtt_client_ref.will_set(LWT_TOPIC, "Dying", qos=0, retain=True)
-    mqtt_client_ref.on_connect = on_connect
-    mqtt_client_ref.on_disconnect = on_disconnect
-    mqtt_client_ref.on_message = on_message
+    client = mqtt.Client()
+    mqtt_client_ref = client
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
 
-    mqtt_client_ref.connect(MQTT_HOST, MQTT_PORT, KEEPALIVE)
-
+    client.connect(MQTT_HOST, MQTT_PORT, KEEPALIVE)
+    threading.Thread(target=client.loop_forever, daemon=True).start()
     threading.Thread(target=periodic_cfh_loop, daemon=True).start()
-    threading.Thread(target=heat_alert_loop, daemon=True).start()
     threading.Thread(target=periodic_room_config_fetch, daemon=True).start()
+    threading.Thread(target=heat_alert_loop, daemon=True).start()
 
-    mqtt_client_ref.loop_start()
-    app.run(host="0.0.0.0", port=WEB_PORT, debug=False)
+    app.run(host="0.0.0.0", port=WEB_PORT)
 
 if __name__ == "__main__":
     main()
