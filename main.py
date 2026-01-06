@@ -33,6 +33,8 @@ WEB_PORT = int(os.getenv("WEB_PORT", 8000))
 ALERT_CHECK_INTERVAL = int(os.getenv("ALERT_CHECK_INTERVAL", 60))
 ALERT_NO_CHANGE_SECONDS = int(os.getenv("ALERT_NO_CHANGE_SECONDS", 600))
 GLOBAL_SLEEP_TOPIC = os.getenv("GLOBAL_SLEEP_TOPIC", "heating/sleep")
+ROOM_CONFIG_REFRESH_INTERVAL = int(os.getenv("ROOM_CONFIG_REFRESH_INTERVAL", 300))  # default 300s
+
 
 # =======================
 # STATE
@@ -55,6 +57,9 @@ MQTT_TOPIC_THERMOSTAT: str = None
 MQTT_TOPIC_CORRECTION: str = None
 
 mqtt_client_ref: mqtt.Client = None
+
+# Next fetch time
+_next_room_config_fetch: float = None
 
 # SSE queue
 sse_queue = queue.Queue(maxsize=10)
@@ -137,7 +142,7 @@ def broadcast_sse():
 # FETCH ROOM CONFIG
 # =======================
 def fetch_room_config(room_name: str):
-    global ROOM_TOPIC, MQTT_TOPIC_THERMOSTAT, MQTT_TOPIC_CORRECTION
+    global ROOM_TOPIC, MQTT_TOPIC_THERMOSTAT, MQTT_TOPIC_CORRECTION, _next_room_config_fetch
     url = f"http://json.io.home/heating?name={room_name.replace(' ', '%20')}"
     try:
         resp = requests.get(url, timeout=5)
@@ -145,7 +150,7 @@ def fetch_room_config(room_name: str):
         data = resp.json()
         if not data:
             log("⚠️ No room data returned")
-            exit(1)
+            return
         room = data[0]
         ROOM_TOPIC = room.get("rootTopic")
         room_name_smol = room_name.replace(" ", "")
@@ -161,8 +166,16 @@ def fetch_room_config(room_name: str):
         })
         log(f"✅ Loaded room config: ROOM_TOPIC={ROOM_TOPIC}, ECO={radiator_valve_state['eco_temperature']}, "
             f"COMFORT={radiator_valve_state['comfort_temperature']}, SP={radiator_valve_state['current_heating_setpoint']}")
+        _next_room_config_fetch = time.time() + ROOM_CONFIG_REFRESH_INTERVAL
+        broadcast_sse()
     except Exception as e:
         log("❌ Failed to fetch room config:", e)
+
+def periodic_room_config_fetch():
+    while True:
+        time.sleep(5)  # check frequently, sleep short
+        if _next_room_config_fetch is None or time.time() >= _next_room_config_fetch:
+            fetch_room_config(ROOM_NAME)
 
 # =======================
 # SPECIAL HANDLERS
@@ -351,11 +364,15 @@ tr:nth-child(even) {background:#f2f2f2;}
 <h2>Room Sensor</h2><table id="sensor"></table>
 <h2>Internal State</h2><table id="internal"></table>
 <h2>Heat Alert</h2><table id="alert"></table>
+<h2>Next Room Config Fetch</h2>
+<p id="next_fetch"></p>
 <script>
 const valveKeys=["current_heating_setpoint","eco_temperature","comfort_temperature"];
 const sensorKeys=["room_sensor_temp"];
 const internalKeys=["sleep_mode","last_cfh","_last_temp","_last_temp_time"];
-const valve=document.getElementById("valve"), sensor=document.getElementById("sensor"), internal=document.getElementById("internal"), alert=document.getElementById("alert");
+const valve=document.getElementById("valve"), sensor=document.getElementById("sensor"), internal=document.getElementById("internal"), alert=document.getElementById("alert"), nextFetch=document.getElementById("next_fetch");
+
+let nextFetchTime=null;
 
 function render(data){
   valve.innerHTML="<tr><th>Key</th><th>Value</th></tr>";
@@ -366,6 +383,7 @@ function render(data){
     if(valveKeys.includes(k)) valve.innerHTML+=`<tr><td>${k}</td><td>${v}</td></tr>`;
     else if(sensorKeys.includes(k)) sensor.innerHTML+=`<tr><td>${k}</td><td>${v}</td></tr>`;
     else if(internalKeys.includes(k)) internal.innerHTML+=`<tr><td>${k}</td><td>${v}</td></tr>`;
+    else if(k=="_next_room_config_fetch") nextFetchTime=v;
   }
   const sp=data["current_heating_setpoint"]||"-";
   const temp=data["room_sensor_temp"]||"-";
@@ -379,6 +397,16 @@ function render(data){
 
 const evt=new EventSource("/events");
 evt.onmessage=e=>{ render(JSON.parse(e.data)); };
+
+setInterval(()=>{
+  if(nextFetchTime){
+    let now=Math.floor(Date.now()/1000);
+    let diff=nextFetchTime-now;
+    let target=new Date(nextFetchTime*1000);
+    if(diff<0) diff=0;
+    nextFetch.innerText=`Next fetch in ${diff.toFixed(0)}s at ${target.toLocaleTimeString()}`;
+  }
+},1000);
 </script>
 </body>
 </html>
@@ -389,11 +417,10 @@ evt.onmessage=e=>{ render(JSON.parse(e.data)); };
 # MAIN
 # =======================
 def main():
-    global mqtt_client_ref, _last_temp_time
+    global mqtt_client_ref, _last_temp_time, radiator_valve_state
     fetch_room_config(ROOM_NAME)
 
     client = mqtt.Client()
-
     mqtt_client_ref = client
     client.on_connect = on_connect
     client.on_message = on_message
@@ -407,6 +434,9 @@ def main():
     _last_temp_time = time.time()
     threading.Thread(target=heat_alert_loop, daemon=True).start()
     threading.Thread(target=periodic_cfh_loop, daemon=True).start()
+    threading.Thread(target=periodic_room_config_fetch, daemon=True).start()
+    # expose next fetch in SSE
+    radiator_valve_state["_next_room_config_fetch"] = time.time() + ROOM_CONFIG_REFRESH_INTERVAL
     broadcast_sse()
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
 
