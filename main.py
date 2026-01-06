@@ -7,7 +7,7 @@ import threading
 import queue
 import requests
 import paho.mqtt.client as mqtt
-from typing import Any, Dict, Callable
+from typing import Any, Dict, Optional
 from flask import Flask, Response, render_template_string
 
 # =======================
@@ -27,6 +27,11 @@ if not HEAT_ALERT_TOPIC:
     print("❌ HEAT_ALERT_TOPIC environment variable is required")
     sys.exit(1)
 
+# Global sleep topic (default heating/sleep)
+HEATING_SLEEP_GLOBAL_TOPIC = os.getenv(
+    "HEATING_SLEEP_GLOBAL_TOPIC", "heating/sleep"
+)
+
 BOOST_SECONDS = int(os.getenv("BOOST_SECONDS", 500))
 SP_DEBOUNCE_SECONDS = int(os.getenv("SP_DEBOUNCE_SECONDS", 5))
 WEB_PORT = int(os.getenv("WEB_PORT", 8000))
@@ -42,7 +47,8 @@ _ignore_initial_valve_updates = True
 radiator_valve_state: Dict[str, Any] = {
     "cfh": None
 }
-sleep_mode = None
+
+sleep_mode: Optional[bool] = None
 last_published: Dict[str, Any] = {}
 last_cfh = None
 
@@ -120,7 +126,7 @@ def periodic_cfh_loop():
             update_cfh(mqtt_client_ref)
 
 # =======================
-# ROOM CONFIG (JSON SERVER)
+# ROOM CONFIG
 # =======================
 def fetch_room_config(room_name: str):
     global ROOM_TOPIC, MQTT_TOPIC_THERMOSTAT, MQTT_TOPIC_CORRECTION
@@ -161,6 +167,45 @@ def room_config_loop():
         broadcast_sse()
 
 # =======================
+# SLEEP HANDLING
+# =======================
+def apply_sleep_mode(client: mqtt.Client, new_sleep: bool):
+    global sleep_mode
+
+    if sleep_mode == new_sleep:
+        return
+
+    sleep_mode = new_sleep
+    radiator_valve_state["sleep"] = sleep_mode
+
+    if sleep_mode:
+        sp = radiator_valve_state.get("eco_temperature")
+        log("🌙 Global sleep ON")
+    else:
+        sp = radiator_valve_state.get("comfort_temperature")
+        log("☀️ Global sleep OFF")
+
+    if sp is not None:
+        radiator_valve_state["current_heating_setpoint"] = sp
+        publish(client, {"current_heating_setpoint": sp})
+
+    update_cfh(client)
+    broadcast_sse()
+
+def parse_sleep_payload(payload: Any) -> Optional[bool]:
+    if isinstance(payload, bool):
+        return payload
+    if isinstance(payload, (int, float)):
+        return bool(payload)
+    if isinstance(payload, str):
+        p = payload.lower()
+        if p in ("1", "true", "on", "yes"):
+            return True
+        if p in ("0", "false", "off", "no"):
+            return False
+    return None
+
+# =======================
 # MQTT CALLBACKS
 # =======================
 def on_connect(client, userdata, flags, rc):
@@ -168,9 +213,20 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(MQTT_TOPIC_THERMOSTAT, qos=0)
     client.subscribe(MQTT_TOPIC_CORRECTION, qos=0)
     client.subscribe(f"{ROOM_TOPIC}/#", qos=0)
+    client.subscribe(HEATING_SLEEP_GLOBAL_TOPIC, qos=0)
 
 def on_message(client, userdata, msg):
+    global _last_temp, _last_temp_time
+
     payload = decode_payload(msg.payload)
+
+    # Global sleep
+    if msg.topic == HEATING_SLEEP_GLOBAL_TOPIC:
+        sleep_val = parse_sleep_payload(payload)
+        if sleep_val is not None:
+            apply_sleep_mode(client, sleep_val)
+        return
+
     if not isinstance(payload, dict):
         return
 
@@ -184,7 +240,6 @@ def on_message(client, userdata, msg):
         temp = payload.get("temperature")
         if temp is not None:
             radiator_valve_state["room_sensor_temp"] = temp
-            global _last_temp, _last_temp_time
             if _last_temp != temp:
                 _last_temp = temp
                 _last_temp_time = time.time()
@@ -217,18 +272,16 @@ app = Flask(__name__)
 @app.route("/events")
 def sse():
     def gen():
-        yield f"data: {json.dumps(radiator_valve_state)}\n\n"
+        yield "data: %s\n\n" % json.dumps(radiator_valve_state)
         while True:
-            yield f"data: {sse_queue.get()}\n\n"
+            yield "data: %s\n\n" % sse_queue.get()
     return Response(gen(), mimetype="text/event-stream")
 
 @app.route("/")
 def index():
     return render_template_string("""
 <html>
-<head>
-<title>{{room}}</title>
-</head>
+<head><title>{{room}}</title></head>
 <body>
 <h1>{{room}}</h1>
 <pre id="out"></pre>
