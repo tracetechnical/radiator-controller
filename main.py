@@ -105,7 +105,7 @@ def publish(client: mqtt.Client, payload: dict, topic: str = None):
             to_publish[key] = value
             last_published[key] = value
     if to_publish:
-        client.publish(topic, json.dumps(to_publish), qos=0)
+        client.publish(topic, json.dumps(to_publish), qos=0, retain=True)
         log(f"📤 Published to {topic}: {to_publish}")
         broadcast_sse()
 
@@ -207,7 +207,7 @@ def room_sensor_special(client, value: float):
         publish(client, {"local_temperature_calibration": round(corrected, 1)})
         log(f"🛠 Room sensor calibration applied: {round(corrected,1)}")
     radiator_valve_state["room_sensor_temp"] = value
-    client.publish(f"{ROOM_TOPIC}/pv", json.dumps(value), qos=0)
+    client.publish(f"{ROOM_TOPIC}/pv", json.dumps(value), qos=0, retain=True)
     update_cfh(client)
     if _last_temp != value:
         _last_temp = value
@@ -276,7 +276,7 @@ def on_message(client, userdata, msg):
         log(f"🌐 Global sleep message received: {payload} → republishing to room")
         try:
             val = "true" if bool(payload) else "false"
-            client.publish(f"{ROOM_TOPIC}/sleep", val, qos=0)
+            client.publish(f"{ROOM_TOPIC}/sleep", val, qos=0, retain=True)
         except Exception as e:
             log("⚠️ Failed to republish global sleep:", e)
         return
@@ -300,7 +300,7 @@ def on_message(client, userdata, msg):
                 client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", json.dumps(new), qos=0)
             if key == "current_heating_setpoint":
                 if time.time() >= _ignore_sp_until:
-                    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(new), qos=0)
+                    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(new), qos=0, retain=True)
         update_cfh(client)
         broadcast_sse()
     elif msg.topic in topic_map:
