@@ -182,8 +182,8 @@ def periodic_room_config_fetch():
 def sleep_special(client, value):
     global _ignore_sp_until
     sp = radiator_valve_state["eco_temperature"] if value else radiator_valve_state["comfort_temperature"]
-    radiator_valve_state["current_heating_setpoint"] = sp
-    publish(client, {"current_heating_setpoint": sp})
+    # radiator_valve_state["current_heating_setpoint"] = sp
+    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(sp), qos=0)
     _ignore_sp_until = time.time() + SP_DEBOUNCE_SECONDS
     client.publish(f"{ROOM_TOPIC}/sleep", "true" if value else "false", qos=0)
     log(f"{'🌙 Sleep ON' if value else '☀️ Sleep OFF'} → SP: {sp}")
