@@ -105,7 +105,7 @@ def publish(client: mqtt.Client, payload: dict, topic: str = None):
             to_publish[key] = value
             last_published[key] = value
     if to_publish:
-        client.publish(topic, json.dumps(to_publish), qos=0, retain=True)
+        client.publish(topic, json.dumps(to_publish), qos=2, retain=True)
         log(f"📤 Published to {topic}: {to_publish}")
         broadcast_sse()
 
@@ -128,7 +128,7 @@ def update_cfh(client: mqtt.Client):
         return
     cfh = temp < sp or boost_time > 0
     if cfh != last_cfh:
-        client.publish(f"{ROOM_TOPIC}/cfh", json.dumps(cfh), qos=0)
+        client.publish(f"{ROOM_TOPIC}/cfh", json.dumps(cfh), qos=2)
         last_cfh = cfh
         log(f"🔥 CFH update → {cfh} (room_temp={temp}, setpoint={sp})")
         broadcast_sse()
@@ -184,10 +184,10 @@ def sleep_special(client, value):
     global _ignore_sp_until
     sp = radiator_valve_state["eco_temperature"] if value else radiator_valve_state["comfort_temperature"]
     radiator_valve_state["current_heating_setpoint"] = sp
-    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(sp), qos=0, retain=True)
+    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(sp), qos=2, retain=True)
     _ignore_sp_until = time.time() + SP_DEBOUNCE_SECONDS
     publish(client,{"current_heating_setpoint": sp})
-    client.publish(f"{ROOM_TOPIC}/sleep", "true" if value else "false", qos=0, retain=True)
+    client.publish(f"{ROOM_TOPIC}/sleep", "true" if value else "false", qos=2, retain=True)
     log(f"{'🌙 Sleep ON' if value else '☀️ Sleep OFF'} → SP: {sp}")
     update_cfh(client)
 
@@ -209,7 +209,7 @@ def room_sensor_special(client, value: float):
         publish(client, {"local_temperature_calibration": round(corrected, 1)})
         log(f"🛠 Room sensor calibration applied: {round(corrected,1)}")
     radiator_valve_state["room_sensor_temp"] = value
-    client.publish(f"{ROOM_TOPIC}/pv", json.dumps(value), qos=0, retain=True)
+    client.publish(f"{ROOM_TOPIC}/pv", json.dumps(value), qos=2, retain=True)
     update_cfh(client)
     if _last_temp != value:
         _last_temp = value
@@ -251,23 +251,23 @@ def on_connect(client, userdata, flags, rc):
         sys.exit(1)
     log("✅ Connected to MQTT:", rc)
 
-    client.subscribe(MQTT_TOPIC_THERMOSTAT, qos=0)
+    client.subscribe(MQTT_TOPIC_THERMOSTAT, qos=2)
     for key in ["eco_temperature", "comfort_temperature", "current_heating_setpoint"]:
         value = radiator_valve_state.get(key)
         if value is not None:
             last_published[key] = None
             publish(client, {key: value})
-    client.subscribe(MQTT_TOPIC_CORRECTION, qos=0)
-    client.subscribe(f"{ROOM_TOPIC}/#", qos=0)
-    client.subscribe(GLOBAL_SLEEP_TOPIC, qos=0)
+    client.subscribe(MQTT_TOPIC_CORRECTION, qos=2)
+    client.subscribe(f"{ROOM_TOPIC}/#", qos=2)
+    client.subscribe(GLOBAL_SLEEP_TOPIC, qos=2)
 
     # LWT setup
-    client.will_set(LWT_TOPIC.lower(), "Dying connection", qos=0, retain=True)
-    client.publish(LWT_TOPIC.lower(), "Online", qos=0, retain=True)
+    client.will_set(LWT_TOPIC.lower(), "Dying connection", qos=2, retain=True)
+    client.publish(LWT_TOPIC.lower(), "Online", qos=2, retain=True)
 
 def on_disconnect(client, userdata, rc):
     log("🔌 Disconnected:", rc)
-    client.publish(LWT_TOPIC.lower(), "Disconnecting", qos=0, retain=True)
+    client.publish(LWT_TOPIC.lower(), "Disconnecting", qos=2, retain=True)
 
 def on_message(client, userdata, msg):
     payload = decode_payload(msg.payload)
@@ -278,7 +278,7 @@ def on_message(client, userdata, msg):
         log(f"🌐 Global sleep message received: {payload} → republishing to room")
         try:
             val = "true" if bool(payload) else "false"
-            client.publish(f"{ROOM_TOPIC}/sleep", val, qos=0, retain=True)
+            client.publish(f"{ROOM_TOPIC}/sleep", val, qos=2, retain=True)
         except Exception as e:
             log("⚠️ Failed to republish global sleep:", e)
         return
@@ -299,10 +299,10 @@ def on_message(client, userdata, msg):
         for key, (_, new) in changes.items():
             radiator_valve_state[key] = new
             if key in ["eco_temperature", "comfort_temperature"]:
-                client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", json.dumps(new), qos=0)
+                client.publish(f"{ROOM_TOPIC}/{key.split('_')[0]}", json.dumps(new), qos=2)
             if key == "current_heating_setpoint":
                 if time.time() >= _ignore_sp_until:
-                    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(new), qos=0, retain=True)
+                    client.publish(f"{ROOM_TOPIC}/sp", json.dumps(new), qos=2, retain=True)
         update_cfh(client)
         broadcast_sse()
     elif msg.topic in topic_map:
